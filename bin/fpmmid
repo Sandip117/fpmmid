@@ -1,0 +1,60 @@
+#!/bin/bash
+help () {
+echo "This script is the wrapper for fpmmid pipelines"
+echo "The following options are available:"
+echo "-h, --help: display this help message"
+echo "-i, --input_path: input file path"
+echo "-m, --mode: define mode of execution, available options:
+0: build 1:pred"
+echo "-o, --out_dir: output path where movie will be created in"
+echo "-p, --platform: platform on which the application will run, by default it will run locally"
+echo "-r, --root_dir: base path where movie images are located"
+}
+
+while [[ $# -gt 0 ]]; do
+    case $1 in
+    -h|--help)
+      help
+      exit 0
+      ;;
+	-i|--input_path)
+	  input_path="$2"
+	  shift # past argument
+	  shift # past value
+	  ;;
+    -o|--out_dir)
+      out_dir="$2"
+      shift #past argument
+      shift #past value
+	  ;; 
+    -p|--platform)
+      platform="$2"
+      shift #past argument
+      shift #past value
+	  ;; 
+    -*|--*)
+      echo "Unknown option $1"
+      exit 1
+      ;;
+    esac
+done
+
+# source environment variables
+source $(pwd)/src/input.sh
+if [[ $platform == "slurm" ]]
+    then
+        sbatch --export=input_path=$input_path,out_dir=$out_dir,root_dir=$root_dir \
+               --output=pred.log \
+               --job-name=pred \
+               --time=$wallclock \
+               --mem=$mem \
+               --ntasks=$num_cpus \
+	           --gres=gpu:$gpu_type:1 \
+                 $root_dir/slurm/pred.sh   
+    else      
+        source $root_dir/fpmmid-env/bin/activate
+        python $root_dir/scripts/run/pred.py \
+                -i $input_path \
+                -o $out_dir \
+                -r $root_dir
+fi
