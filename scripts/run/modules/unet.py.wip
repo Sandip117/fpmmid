@@ -1,0 +1,319 @@
+"""
+This module provides the 3D UNET Architecture with additional
+regularization methods, and loss functions
+"""
+import tensorflow as tf
+from tensorflow import keras as ks
+import tensorflow_addons as tfa
+import horovod.tensorflow.keras as hvd
+
+eps = ks.backend.epsilon()
+PADDING = 'same'
+KERNEL_SIZE = (3,3,3)
+
+# UNET Architecture
+def norm_conv(x_in, gn_, filters, scale, activation):
+    """
+    Upsampling layers for UNET: Group normalization and 3D convolutional
+    """
+    x_tmp = tfa.layers.GroupNormalization(groups = gn_, axis = -1)(x_in)
+    x_out = ks.layers.Conv3D(filters = filters // scale, \
+                                 kernel_size = KERNEL_SIZE, \
+                                 activation = activation, \
+                                 padding = PADDING)(x_tmp)
+    return x_out
+
+def max_pool_drop(x_in, pool_size, strides, d_rate):
+    """
+    Maxpooling layer followed by dropout layer
+    """
+    x_tmp = ks.layers.MaxPooling3D(pool_size = pool_size, strides = strides, \
+                               padding = PADDING)(x_in)
+    x_out = ks.layers.Dropout(d_rate)(x_tmp)
+    return x_out
+
+def norm_convt(x_in, gn_, filters, strides, scale, activation):
+    """
+    Downsampling layers for UNET: Group normalization and 3D convolutional
+    """
+    x_tmp = tfa.layers.GroupNormalization(groups=gn_, axis = -1)(x_in)
+    x_out = ks.layers.Conv3DTranspose(filters =  filters // scale, \
+                                  kernel_size = KERNEL_SIZE, \
+                                  strides = strides, \
+                                  activation = activation, \
+                                  padding = PADDING)(x_tmp)
+    return x_out
+
+def network(inputs, num_classes, d_rate, init_fil, scale, activation1):
+    """
+    This function will create the Neural network for training and inference
+    """
+    gn_ = 1 # consider testing with 4 for newer versions
+    gn_init = inputs.shape[-1]
+	# Ensure gn_ <= number of input channels
+    # number of layers for group normalization cannot exceed number of
+    gn_init = min(gn_init, gn_)
+
+    # two layers to with init_fil filters and same size of images
+    x_up = norm_conv(x_in = inputs, gn_ = gn_init, filters = init_fil, \
+                      scale = scale, \
+                      activation = activation1)
+    
+    x_up = norm_conv(x_in = x_up, gn_ = gn_init, filters = init_fil, \
+                      scale = scale, \
+                      activation = activation1)
+    x_up = tfa.layers.GroupNormalization(groups = gn_, axis = -1)(x_up)
+    lx_0 = x_up # for the skipping step
+
+    x_up = max_pool_drop(x_in = x_up, pool_size = (2,2,2), strides = (2,2,2), \
+                          d_rate = d_rate)
+
+    x_up = ks.layers.Conv3D(init_fil * 2 // scale, kernel_size = KERNEL_SIZE, \
+                             padding = PADDING, \
+                             activation = activation1)(x_up)
+
+    x_up = norm_conv(x_in = x_up, gn_ = gn_, filters = init_fil * 2, \
+                      scale = scale, \
+                      activation = activation1)
+    x_up = ks.layers.Dropout(d_rate)(x_up)
+    x_up = tfa.layers.GroupNormalization(groups=gn_, axis = -1)(x_up)
+    lx_1 = x_up
+    x_up = max_pool_drop(x_in = x_up, pool_size = (2,2,2), strides = (2,2,2), \
+                          d_rate = d_rate)
+
+    x_up = ks.layers.Conv3D(init_fil * 4 // scale, kernel_size = KERNEL_SIZE, padding = PADDING, \
+                         activation = activation1)(x_up)
+    x_up = ks.layers.Dropout(d_rate)(x_up)
+
+    x_up = norm_conv(x_in = x_up, gn_ = gn_, filters = init_fil * 4, \
+                      scale = scale, \
+                      activation = activation1)
+
+    x_up = ks.layers.Dropout(d_rate)(x_up)
+    x_up = tfa.layers.GroupNormalization(groups=gn_, axis = -1)(x_up)
+    lx_2 = x_up
+
+    x_up = max_pool_drop(x_in = x_up, pool_size = (2,2,2), strides = (2,2,2), \
+                          d_rate = d_rate)
+
+    x_up = ks.layers.Conv3D(init_fil * 8 // scale, kernel_size = KERNEL_SIZE, padding = PADDING, \
+                         activation = activation1)(x_up)
+    x_up = ks.layers.Dropout(d_rate)(x_up)
+
+    x_up = norm_conv(x_in = x_up, gn_ = gn_, filters = init_fil * 8, \
+                      scale = scale, \
+                      activation = activation1)
+
+    x_up = ks.layers.Dropout(d_rate)(x_up)
+    x_up = tfa.layers.GroupNormalization(groups=gn_, axis = -1)(x_up)
+    lx_3 = x_up
+
+    x_up = max_pool_drop(x_in = x_up, pool_size = (2,2,2), strides = (2,2,2), \
+                          d_rate = d_rate)
+
+    x_up = ks.layers.Conv3D(init_fil * 16 // scale, kernel_size = KERNEL_SIZE, \
+                            padding = PADDING, \
+                            activation = activation1)(x_up)
+    x_up = ks.layers.Dropout(d_rate)(x_up)
+
+    x_up = norm_conv(x_in = x_up, gn_ = gn_, filters = init_fil * 16, \
+                     scale = scale, \
+                     activation = activation1)
+    x_up = ks.layers.Dropout(d_rate)(x_up)
+
+    x_down = norm_convt(x_in = x_up, gn_ = gn_, filters = init_fil * 8, \
+                         strides = (2,2,2), scale = scale, \
+                         activation = activation1)
+
+    x_down = ks.layers.Dropout(d_rate)(x_down)
+    x_down = tfa.layers.GroupNormalization(groups=gn_, axis = -1)(x_down)
+    print("x shape: ",x_down.shape)
+    print("lx3: ",lx_3.shape)
+    
+    x_down = ks.layers.Concatenate()([lx_3, x_down])
+    # note = conv2d transpose vs upsampling\n conv2d transpose:
+    # For each pixel of input,it applies the kernel -multiply \n
+    # pixels by kernel weights and creates a 3x3 subset in this case, \n
+    # then march through the other pixels thus it's both applying \n
+    # a kernel and increasing the size upsampling2d: for each pixel \n
+    # of the input, it just copies the pixel and creates a 3x3 subset \n
+    # in this case. so no applying of kernels, More info: \n
+    # https://www.youtube.com/watch?v=ilkSwsggSNM)"""
+    x_down = ks.layers.Conv3D(init_fil * 8 // scale, kernel_size = KERNEL_SIZE, \
+                         activation = activation1, padding = PADDING)(x_down)
+    x_down = ks.layers.Dropout(d_rate)(x_down)
+
+    x_down = norm_convt(x_in = x_down, gn_ = gn_, filters = init_fil * 4, \
+                         strides = (2,2,2), scale = scale, \
+                         activation = activation1)
+
+    x_down = ks.layers.Dropout(d_rate)(x_down)
+    x_down = tfa.layers.GroupNormalization(groups=gn_, axis = -1)(x_down)
+    x_down = ks.layers.Concatenate()([x_down , lx_2])
+    
+    print("x shape: ",x_down.shape)
+    print("lx2: ",lx_2.shape)
+    x_down = ks.layers.Conv3D(init_fil * 4 // scale, kernel_size = KERNEL_SIZE, \
+                         activation = activation1, padding = PADDING)(x_down)
+
+    x_down = ks.layers.Dropout(d_rate)(x_down)
+
+    x_down = norm_conv(x_in = x_down, gn_ = gn_, filters = init_fil * 4, \
+                      scale = scale, \
+                      activation = activation1)
+
+    x_down = ks.layers.Dropout(d_rate)(x_down)
+
+    x_down = norm_convt(x_in = x_down, gn_ = gn_, filters = init_fil * 2, \
+                         strides = (2,2,2), scale = scale, \
+                         activation = activation1)
+
+    x_down = ks.layers.Dropout(d_rate)(x_down)
+    x_down = tfa.layers.GroupNormalization(groups=gn_, axis = -1)(x_down)
+    x_down = ks.layers.Concatenate()([x_down , lx_1])
+    x_down = ks.layers.Conv3D(init_fil * 2 // scale, kernel_size = KERNEL_SIZE, \
+                         activation = activation1, padding = PADDING)(x_down)
+
+    x_down = ks.layers.Dropout(d_rate)(x_down)
+    x_down = norm_conv(x_in = x_down, gn_ = gn_, filters = init_fil * 2, \
+                      scale = scale, \
+                      activation = activation1)
+
+    x_down = ks.layers.Dropout(d_rate)(x_down)
+    x_down = norm_conv(x_in = x_down, gn_ = gn_, filters = init_fil * 2, \
+                      scale = scale, \
+                      activation = activation1)
+    x_down = ks.layers.Dropout(d_rate)(x_down)
+
+    x_down = norm_convt(x_in = x_down, gn_ = gn_, filters = init_fil, \
+                         strides = (2,2,2), scale = scale, \
+                         activation = activation1)
+
+    x_down = ks.layers.Dropout(d_rate)(x_down)
+    x_down = tfa.layers.GroupNormalization(groups=gn_, axis = -1)(x_down)
+    x_down = ks.layers.Concatenate()([x_down , lx_0])
+    x_down = ks.layers.Conv3D(init_fil // scale, kernel_size = KERNEL_SIZE, \
+                         activation = activation1, \
+                         padding = PADDING)(x_down)
+    x_down = ks.layers.Dropout(d_rate)(x_down)
+
+    x_down = norm_conv(x_in = x_down, gn_ = gn_, filters = init_fil, \
+                      scale = scale, \
+                      activation = activation1)
+    x_down = ks.layers.Dropout(d_rate)(x_down)
+    x_down = tfa.layers.GroupNormalization(groups=gn_, axis = -1)(x_down)
+    outputs = ks.layers.Conv3D(num_classes, kernel_size = (1,1,1), \
+                               activation = "softmax")(x_down)
+    # no normalization/dropout on the output layer
+
+	# To match the mask sizes
+    #outputs = ks.layers.Cropping3D(cropping = ((3,2),(0,0),(0,0)))(outputs)
+    return outputs
+
+def dice_coef(y_true, y_pred):
+    """
+    Dice coefficient similarlity metrics
+    """
+    y_true_f = ks.backend.flatten(y_true[:,:,:,:,1:]) # ignore background layer
+    y_pred_f = ks.backend.flatten(y_pred[:,:,:,:,1:]) # ignore background layer
+    intersection = ks.backend.sum(y_true_f * y_pred_f)
+    return (2. * intersection + eps) / (ks.backend.sum(y_true_f) \
+            + ks.backend.sum(y_pred_f) + eps)
+
+def dice_coef_loss(y_true, y_pred):
+    """
+    Dice coefficient loss function
+    """
+    return 1 - dice_coef(y_true, y_pred)
+
+def w_dice_coef_loss(sample_weight):
+    """
+    Class-weighted Dice coefficient loss function
+    """
+    def w_dice_coef_loss_fun(y_true, y_pred):
+        dims = y_true.shape
+        intersection = eps
+        denom = eps
+        for i in range(0, dims[4]):
+            y_true_f = ks.backend.flatten(y_true[:,:,:,:,i])
+            y_pred_f = ks.backend.flatten(y_pred[:,:,:,:,i])
+            intersection += sample_weight[i] * ks.backend.sum(y_true_f * y_pred_f)
+            denom += sample_weight[i] * ks.backend.sum(y_true_f + y_pred_f)
+        coef = 2. * intersection / denom
+        # internal return will be called within the neural network training step
+        return 1 - coef
+    return w_dice_coef_loss_fun
+
+def w_dice_coef(sample_weight):
+    """
+    Class-weighted Dice similarity metrics
+    """
+    def w_dice_coef_fun(y_true, y_pred):
+        dims = y_true.shape
+        intersection = eps
+        denom = eps
+        for i in range(0, dims[4]):
+            y_true_f = ks.backend.flatten(y_true[:,:,:,:,i])
+            y_pred_f = ks.backend.flatten(y_pred[:,:,:,:,i])
+            intersection += sample_weight[i] * ks.backend.sum(y_true_f * y_pred_f)
+            denom += sample_weight[i] * ks.backend.sum(y_true_f + y_pred_f)
+        coef = 2. * intersection / denom
+        return coef
+    return w_dice_coef_fun
+
+def ccw(sample_weight):
+    """
+    Weighted categorical cross entropy loss function
+    sample_weights are fed into the core loss function
+    """
+    def ccw_loss(y_true, y_pred):
+        """
+        Weighted Categorical cross entropy loss function
+        core loss function  with sample_weights fed from the upstream function
+        """
+        dims = y_true.shape
+        y_true_f = ks.backend.reshape(y_true, (dims[0] * dims[1] * dims[2] * dims[3], dims[4]))
+        y_pred_f = ks.backend.reshape(y_pred, (dims[0] * dims[1] * dims[2] * dims[3], dims[4]))
+        loss = eps
+
+        # https://github.com/keras-team/keras/blob/d8fcb9d4d4dad45080ecfdd575483653028f8eda/keras/backend.py#L5039
+        # scale preds so that the class probas of each sample sum to 1
+        y_pred_f = y_pred_f / tf.reduce_sum(y_pred_f, -1, True)
+
+        # Compute cross entropy from probabilities.
+        epsilon_ = tf.constant(ks.backend.epsilon(), y_pred_f.dtype.base_dtype)
+        y_pred_f = tf.clip_by_value(y_pred_f, epsilon_, 1. - epsilon_)
+
+        for i in range(0, dims[4]):
+            loss += - sample_weight[i] * ks.backend.sum(y_true_f[:, i] \
+                    * tf.math.log(y_pred_f[:, i]))
+        loss /= (dims[0] * dims[1] * dims[2] * dims[3] * dims[4])
+        return loss
+    return ccw_loss
+
+def mean_iou_argmax(y_true, y_pred):
+    """
+    intersection over union similarity metrics
+    """
+    y_pred_argmax = tf.keras.backend.argmax(y_pred, axis = -1)
+    y_true_argmax = tf.keras.backend.argmax(y_true, axis = -1)
+    mio = tf.keras.metrics.MeanIoU(num_classes=4) # consider feeding num_classes as
+                                                # a function-in-function similar to ccw
+    mio.update_state(y_true_argmax, y_pred_argmax)
+    return mio.result().numpy()
+
+def create_model(init_lr, inputs, is_parallel, outputs, sample_weight):
+    """
+    Create Neural Network model
+    """
+    model = tf.keras.Model(inputs = [inputs], outputs = [outputs])
+    if is_parallel == "true":
+        opt = tf.keras.optimizers.Adam(learning_rate = init_lr * hvd.size())
+        opt = hvd.DistributedOptimizer(opt)
+    else:
+        opt = tf.keras.optimizers.Adam(learning_rate = init_lr)
+
+    model.compile(optimizer = opt, loss = w_dice_coef_loss(sample_weight = sample_weight) ,\
+                  metrics =[w_dice_coef(sample_weight = sample_weight), dice_coef,\
+                  mean_iou_argmax], experimental_run_tf_function=False, run_eagerly=True)
+    return model
