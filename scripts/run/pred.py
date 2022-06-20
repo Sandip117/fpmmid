@@ -11,6 +11,7 @@ os.environ['TF_CPP_MIN_LOG_LEVEL'] = '1'
 import time
 import logging
 import pickle
+import numpy as np
 from modules import unet as un
 from modules import seg_utility as seg_u
 from modules import vol_reader as vlr
@@ -30,6 +31,7 @@ def main():
     input_data = Subject(model_name)
     dims, num_channels, num_classes, sid, vol = input_data.prep_data(input_path, \
                                                                 root_dir)
+
     et_1 = time.time()
     model = Pred(model_name)
     model.run_pred(dims, num_channels, num_classes, out_dir, root_dir, sid, vol)
@@ -134,8 +136,8 @@ class Pred:
         logging.info("Inference - Finished.")
 
         # Write nifti
-        self.obj_config.write_nifti(mask_pred[0], sid)
-  
+        self.obj_config.write_nifti(np.argmax(mask_pred[0], axis = 3), sid)
+        
         # Write image
         self.obj_config.write_image(vol[0], mask_pred[0], out_dir, sid)
 
